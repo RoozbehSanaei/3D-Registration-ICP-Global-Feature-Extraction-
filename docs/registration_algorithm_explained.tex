@@ -1,0 +1,279 @@
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{microtype}
+\geometry{margin=1in}
+
+\title{Rigid 3D Point Registration via RANSAC Initialization and Trimmed Point-to-Point ICP}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{1.\ \ Inputs}
+
+\paragraph{Point sets.}
+You start with two unordered sets of 3D points. The moving set is the source $\{\mathbf{p}_i\}_{i=1}^{N_s}$ and the fixed set is the target $\{\mathbf{q}_j\}_{j=1}^{N_t}$. Each point is a 3-vector, so $\mathbf{p}_i\in\mathbb{R}^3$ and $\mathbf{q}_j\in\mathbb{R}^3$. No ordering is assumed. A point can appear anywhere in the list. The method relies on geometry, not index alignment, unless you explicitly provide correspondence candidates for the robust stage.
+
+\paragraph{Initial pose (optional).}
+Some runs begin with a guess for the rigid pose. That guess is a rotation $(\mathbf{R}_0)$ and a translation $(\mathbf{t}_0)$. This guess matters because the local refinement step behaves like a hill-climber. If you start far away, nearest-neighbor matches can be wrong, which pushes the update in the wrong direction. The robust stage can generate a usable start when such a guess is not available.
+
+\paragraph{Tuning parameters.}
+The local refinement uses a maximum iteration count $(K)$, a stopping tolerance $(\varepsilon)$, and a trimming ratio $(\rho)$. The robust stage uses an inlier threshold $(\tau)$, an iteration count $(M)$, and a random seed. A correspondence cap $(N_{\max})$ is sometimes used for the nearest-neighbor route so you do not carry every pair forward.
+
+\paragraph{Correspondence candidates (optional).}
+The robust stage can accept a list of candidate matched pairs $\{(\mathbf{a}_k,\mathbf{b}_k)\}_{k=1}^{N_c}$. Here $\mathbf{a}_k$ is a source-side point and $\mathbf{b}_k$ is a target-side point that you believe should match. These can come from descriptors, tracking, or any upstream matching method. They can be noisy and can include many wrong matches. The robust stage is designed to survive that.
+
+\section*{2.\ \ Outputs}
+
+\paragraph{Estimated rigid transform.}
+The primary output is a rigid transform $(\widehat{\mathbf{R}},\widehat{\mathbf{t}})$. The intent is that when you apply it to source points, they land on the target geometry. In formulas, the predicted aligned point is $\widehat{\mathbf{R}}\mathbf{p}+\widehat{\mathbf{t}}$. If alignment is good, that predicted point lies near a corresponding target point.
+
+\paragraph{Fit diagnostics (common).}
+The local refinement naturally produces an error score, which is reported as an RMSE. The robust stage naturally produces an inlier count and an inlier mask. These numbers matter because rigid registration is often used inside larger pipelines. You want to know whether the output is trustworthy, and these diagnostics are simple evidence.
+
+\section*{3.\ \ Algorithm Pseudocode}
+
+\paragraph{Step 1 --- Start state.}
+Input: source points, target points, optional initial pose. Output: current pose $(\mathbf{R},\mathbf{t})$ used by Step~2.
+
+\paragraph{Step 2 --- Apply current pose to the moving set.}
+Input: current pose from (Step~1), source points. Output: transformed source points used by Step~3.
+
+\paragraph{Step 3 --- Propose matches by proximity.}
+Input: transformed source points from (Step~2), target points. Output: nearest-neighbor indices and distances used by Step~4 and Step~6.
+
+\paragraph{Step 4 --- Keep only stable pairs.}
+Input: distances from (Step~3), trimming ratio. Output: selected indices used by Step~5 and Step~6.
+
+\paragraph{Step 5 --- Solve a best rigid update from selected pairs.}
+Input: paired points built from (Step~3) and (Step~4). Output: incremental pose update used by Step~6.
+
+\paragraph{Step 6 --- Update pose and decide whether to stop.}
+Input: old pose from (Step~1), update from (Step~5), distances from (Step~3) restricted by (Step~4). Output: new pose fed back to Step~2, plus final pose when stopping.
+
+\paragraph{Step 7 --- Robust initializer from candidate matches (optional route).}
+Input: candidate pairs, threshold, iteration cap. Output: robust initial pose used by Step~1.
+
+\paragraph{Step 8 --- Pose comparison (optional reporting).}
+Input: estimated pose, reference pose if available. Output: rotation-angle and translation error.
+
+\section*{Step 1 --- Start state}
+
+\subsection*{Rigid motion model $(\mathbf{R},\mathbf{t})$}
+
+\begin{equation}
+\mathbf{x}'=\mathbf{R}\mathbf{x}+\mathbf{t}
+\end{equation}
+
+This is the core geometric assumption. The rotation $\mathbf{R}$ belongs to the special orthogonal group $SO(3)$, meaning it preserves lengths and angles and has determinant $+1$. The translation $\mathbf{t}$ shifts every point by the same amount. The combination expresses a shared shape under a changed pose. This is appropriate when the two point sets come from the same rigid object or two scans of a static scene under sensor motion. It becomes unreliable for deformation, rolling-shutter distortions, or mixtures of different moving objects.
+
+\subsection*{Composition of poses}
+
+\begin{equation}
+(\mathbf{R}_A,\mathbf{t}_A)\circ(\mathbf{R}_B,\mathbf{t}_B)=\left(\mathbf{R}_A\mathbf{R}_B,\ \mathbf{R}_A\mathbf{t}_B+\mathbf{t}_A\right)
+\end{equation}
+
+This equation explains how incremental updates accumulate. If you apply $(\mathbf{R}_B,\mathbf{t}_B)$ first and then $(\mathbf{R}_A,\mathbf{t}_A)$, the net rotation is the matrix product. The net translation is the rotated inner translation plus the outer translation. This mechanism is how iterative refinement walks from an initial guess to the final estimate. Each iteration produces a small update, and composition keeps those updates consistent under the correct frame ordering.
+
+\subsection*{Inverse of a pose}
+
+\begin{equation}
+(\mathbf{R},\mathbf{t})^{-1}=\left(\mathbf{R}^\top,\ -\mathbf{R}^\top\mathbf{t}\right)
+\end{equation}
+
+The inverse exists because $\mathbf{R}$ is orthonormal. Transpose equals inverse for rotations, which makes the rotation part straightforward. The translation part is subtler. Reversing a translation requires subtracting it, and because the inverse lives in the opposite frame, that subtraction must be expressed in the inverse-rotated basis. This identity is central for error reporting because the meaningful pose discrepancy is a relative transform.
+
+\section*{Step 2 --- Apply current pose to the moving set}
+
+\subsection*{Transform each source point}
+
+\begin{equation}
+\mathbf{p}_i^{(t)}=\mathbf{R}\mathbf{p}_i+\mathbf{t}
+\end{equation}
+
+This is the rigid model applied point-by-point. The transformed set $\{\mathbf{p}_i^{(t)}\}$ is the version of the source compared to the target at the current iteration. If the current pose is close to correct, most transformed source points land near target points, which makes correspondence selection stable. If the pose is far off, distances are large, nearest-neighbor assignments become unreliable, and the update can drift toward an incorrect local optimum.
+
+\section*{Step 3 --- Propose matches by proximity}
+
+\subsection*{Nearest-neighbor assignment}
+
+\begin{equation}
+j^\*(i)=\arg\min_{j\in\{1,\dots,N_t\}}\left\|\mathbf{p}_i^{(t)}-\mathbf{q}_j\right\|_2
+\end{equation}
+
+This step converts two unordered sets into provisional pairs. For each transformed source point, you choose the closest target point in Euclidean distance. This assumes that, under a reasonable pose, the true counterpart tends to be closest. When overlap is strong and the sampling density is adequate, this assumption holds well. When overlap is partial or geometry repeats, the nearest target can be a different physical point, which injects wrong constraints into the next pose update.
+
+\subsection*{Distance of each proposed match}
+
+\begin{equation}
+d_i=\left\|\mathbf{p}_i^{(t)}-\mathbf{q}_{j^\*(i)}\right\|_2
+\end{equation}
+
+The distances are not only a score. They become the raw evidence used for robustness. Large values often correspond to outliers, missing overlap, or clutter points. Small values are more likely to reflect plausible matches. Later stages use these distances to decide which pairs should influence the rigid update and which should be ignored.
+
+\section*{Step 4 --- Keep only stable pairs}
+
+\subsection*{Trimming count}
+
+\begin{equation}
+K_{\text{keep}}=\left\lceil(1-\rho)N_s\right\rceil
+\end{equation}
+
+The trimming ratio $\rho$ provides a simple robustness mechanism inside the refinement loop. If $\rho=0.3$, the worst $30\%$ of matches, as measured by distance, are discarded for the next fit. This is useful when the source includes outliers or when overlap is incomplete. It is also useful early in the loop when nearest-neighbor assignments are still settling. Trimming limits the influence of the noisiest constraints on the rigid update.
+
+\subsection*{Selection of indices}
+
+\begin{equation}
+\mathcal{I}=\text{indices of the }K_{\text{keep}}\text{ smallest values in }\{d_i\}
+\end{equation}
+
+This is a ranking and selection operation. You sort by distance and keep the smallest set. The kept index set $\mathcal{I}$ defines the active constraints that will shape the next rigid update. Trimming is heuristic, so it can still fail when the current pose is extremely wrong. In that case even the smallest distances can correspond to wrong structure, especially for repetitive shapes or sparse targets.
+
+\section*{Step 5 --- Solve a best rigid update from selected pairs}
+
+\subsection*{Centroids}
+
+\begin{equation}
+\bar{\mathbf{a}}=\frac{1}{K}\sum_{k=1}^{K}\mathbf{a}_k,\qquad
+\bar{\mathbf{b}}=\frac{1}{K}\sum_{k=1}^{K}\mathbf{b}_k
+\end{equation}
+
+Centroids separate translation from rotation. Subtracting centroids moves both point sets to be centered at the origin. After centering, the alignment task becomes primarily about matching directions and relative geometry. This improves numerical stability and gives the rotation estimation step a clean objective that does not mix in a constant offset.
+
+\subsection*{Cross-covariance}
+
+\begin{equation}
+\mathbf{H}=\sum_{k=1}^{K}(\mathbf{a}_k-\bar{\mathbf{a}})(\mathbf{b}_k-\bar{\mathbf{b}})^\top
+\end{equation}
+
+The matrix $\mathbf{H}$ accumulates how source directions correlate with target directions under the current correspondences. Each term is an outer product that contributes a rank-1 vote for how a centered source vector should map toward a centered target vector. Summation aggregates those votes. When correspondences are correct, $\mathbf{H}$ encodes a strong rotational relationship. When correspondences contain many errors, $\mathbf{H}$ becomes noisy and the resulting rotation can drift.
+
+\subsection*{SVD of the cross-covariance}
+
+\begin{equation}
+\mathbf{H}=\mathbf{U}\mathbf{\Sigma}\mathbf{V}^\top
+\end{equation}
+
+SVD expresses $\mathbf{H}$ as orthonormal bases $\mathbf{U}$ and $\mathbf{V}$ with singular values in $\mathbf{\Sigma}$. Intuitively, $\mathbf{U}$ captures dominant directions of variation on the source side as they appear through the correspondence coupling, and $\mathbf{V}$ does the same for the target side. The singular values encode how strongly each paired direction is supported. This factorization enables a closed-form rotation estimate under an orthonormality constraint.
+
+\subsection*{Optimal rotation}
+
+\begin{equation}
+\Delta\mathbf{R}=\mathbf{V}\mathbf{U}^\top
+\end{equation}
+
+This is the Kabsch solution. It produces the rotation that best aligns the centered source points to the centered target points in a least-squares sense while preserving orthonormality. One interpretation is that it maximizes $\mathrm{tr}(\Delta\mathbf{R}\mathbf{H})$ subject to $\Delta\mathbf{R}\in SO(3)$. The $\mathbf{V}\mathbf{U}^\top$ form falls out of that constrained optimization. Operationally, it means the rigid update is fast: once correspondences are chosen, the update is a few matrix operations and one SVD.
+
+\subsection*{Reflection correction}
+
+\begin{equation}
+\det(\Delta\mathbf{R})=+1
+\end{equation}
+
+SVD can yield a matrix with determinant $-1$, which represents a reflection rather than a proper rotation. A reflection can reduce squared error in some cases, which is why it appears, but it is not a valid rigid motion in 3D. The standard correction flips the sign of one singular vector before recomputing $\Delta\mathbf{R}$. This enforces membership in $SO(3)$ and prevents a mirror solution that would break downstream geometry.
+
+\subsection*{Translation after rotation}
+
+\begin{equation}
+\Delta\mathbf{t}=\bar{\mathbf{b}}-\Delta\mathbf{R}\,\bar{\mathbf{a}}
+\end{equation}
+
+Once the rotation is fixed, the translation that aligns centroids is determined. The term $\Delta\mathbf{R}\,\bar{\mathbf{a}}$ is the rotated source centroid. Subtracting it from the target centroid shifts the rotated source so its center matches the target center. This equation clarifies why centroid computation is performed first. It also emphasizes that translation is not independently optimized here. It is implied by the rotational alignment of centered clouds.
+
+\section*{Step 6 --- Update pose and decide whether to stop}
+
+\subsection*{Pose update}
+
+\begin{equation}
+\mathbf{R}\leftarrow \Delta\mathbf{R}\mathbf{R},\qquad
+\mathbf{t}\leftarrow \Delta\mathbf{R}\mathbf{t}+\Delta\mathbf{t}
+\end{equation}
+
+This is pose composition written as an assignment. The algorithm maintains a pose that maps original source points into the target frame. Each iteration computes $(\Delta\mathbf{R},\Delta\mathbf{t})$ using points already expressed in that frame, so the update multiplies on the left. The translation update includes a rotation of the prior translation because translations are frame-dependent. This update rule is a common source of bugs if multiplication order is reversed, so keeping the composition equation visible helps.
+
+\subsection*{RMSE on selected correspondences}
+
+\begin{equation}
+\mathrm{RMSE}=\sqrt{\frac{1}{K}\sum_{i\in\mathcal{I}} d_i^2}
+\end{equation}
+
+This score measures geometric consistency under the current pose using only the trimmed set. Squaring distances makes large residuals dominate, which is why trimming is important. Without trimming, a small number of gross outliers can dominate the objective and pull the rotation in an incorrect direction. RMSE is also a convenient progress signal. Under healthy behavior it decreases monotonically or almost monotonically as correspondences stabilize.
+
+\subsection*{Convergence test}
+
+\begin{equation}
+\left|\mathrm{RMSE}_{k}-\mathrm{RMSE}_{k-1}\right|<\varepsilon
+\end{equation}
+
+This condition stops refinement when progress becomes smaller than a chosen tolerance. The tolerance $\varepsilon$ is in the same units as the points. If the clouds are normalized to a unit box, $\varepsilon$ can be small. If the clouds are in meters with typical scales of tens of meters, $\varepsilon$ must be scaled accordingly. This criterion prevents the algorithm from spending iterations chasing numerical noise or tiny correspondence flips.
+
+\section*{Step 7 --- Robust initializer from candidate matches (optional route)}
+
+\subsection*{Non-degeneracy of the minimal sample}
+
+\begin{equation}
+\left\|(\mathbf{a}_1-\mathbf{a}_0)\times(\mathbf{a}_2-\mathbf{a}_0)\right\|_2>\delta
+\end{equation}
+
+A rigid transform in 3D can be estimated from three correspondence pairs, but only if the three source points form a triangle with nonzero area. Collinear points do not constrain rotation around the line, which makes the estimate unstable and sensitive to noise. The cross product magnitude equals twice the triangle area. The threshold $\delta$ is a small constant used to reject nearly collinear triples so that the SVD fit has a meaningful geometric baseline.
+
+\subsection*{Inlier test for a candidate model}
+
+\begin{equation}
+\left\|\mathbf{R}\mathbf{a}_k+\mathbf{t}-\mathbf{b}_k\right\|_2<\tau
+\end{equation}
+
+This inequality decides whether a candidate correspondence is consistent with a proposed pose. The threshold $\tau$ defines what deviation you are willing to attribute to noise and sampling. If $\tau$ is too tight, even correct correspondences fail the test due to noise, and the robust stage struggles to find a large inlier set. If $\tau$ is too loose, many wrong matches pass, which makes the inlier count less meaningful and can lead to a poor initialization for the refinement stage.
+
+\subsection*{Refit on inliers}
+
+\begin{equation}
+(\mathbf{R},\mathbf{t})=\arg\min_{\mathbf{R}\in SO(3),\mathbf{t}\in\mathbb{R}^3}\sum_{k\in\mathcal{K}_{\text{in}}}\left\|\mathbf{R}\mathbf{a}_k+\mathbf{t}-\mathbf{b}_k\right\|_2^2
+\end{equation}
+
+This objective is the same least-squares rigid fit solved by the SVD method in Step~5, now restricted to the inlier index set $\mathcal{K}_{\text{in}}$. The rationale is that the first model was fit to only three pairs, which may contain substantial noise. Once a larger inlier set is identified, refitting averages that noise out and yields a more accurate pose. That refined pose is then passed as the initial pose for the refinement loop.
+
+\subsection*{Inlier RMSE (optional diagnostic)}
+
+\begin{equation}
+\mathrm{RMSE}_{\text{in}}=\sqrt{\frac{1}{n_{\text{in}}}\sum_{k\in\mathcal{K}_{\text{in}}}\left\|\mathbf{R}\mathbf{a}_k+\mathbf{t}-\mathbf{b}_k\right\|_2^2}
+\end{equation}
+
+This quantity is a sanity check that complements the inlier count. A very large inlier count with a high inlier RMSE suggests that the threshold is permissive or the correspondences are weak. A moderate inlier count with a low RMSE can still be an excellent seed for refinement because the subsequent nearest-neighbor stage becomes reliable once the pose is in the right basin of attraction.
+
+\section*{Step 8 --- Pose comparison (optional reporting)}
+
+\subsection*{Relative transform between estimate and reference}
+
+\begin{equation}
+(\mathbf{R}_\Delta,\mathbf{t}_\Delta)=(\widehat{\mathbf{R}},\widehat{\mathbf{t}})^{-1}\circ(\mathbf{R}_\star,\mathbf{t}_\star)
+\end{equation}
+
+This constructs the transform that maps the estimated pose to the reference pose. If estimate and reference coincide, the relative transform is identity. This is preferable to subtracting translations or comparing matrix entries because it respects the group structure of rigid motions. The inverse and composition operations used here are the ones defined in Step~1.
+
+\subsection*{Rotation angle from the trace}
+
+\begin{equation}
+\theta=\arccos\!\left(\mathrm{clip}\!\left(\frac{\mathrm{tr}(\mathbf{R}_\Delta)-1}{2},-1,1\right)\right)
+\end{equation}
+
+This maps a rotation matrix to a single angle. For a proper rotation, the relationship between trace and angle is exact: $(\mathrm{tr}(\mathbf{R})-1)/2=\cos\theta$. The clipping accounts for floating-point drift that can push the argument slightly outside $[-1,1]$, which would make $\arccos$ undefined. The resulting angle is an intuitive measure of rotational discrepancy that is independent of axis choice.
+
+\subsection*{Translation error norm}
+
+\begin{equation}
+e_t=\|\mathbf{t}_\Delta\|_2
+\end{equation}
+
+This compresses the 3D translation discrepancy into a scalar magnitude. Reporting this along with the rotation-angle error gives a compact description of how far the estimated rigid motion is from the reference. In many applications, these two scalars are the primary success metrics used to decide whether the registration is acceptable.
+
+\section*{Coverage map (equations tied to computational stages)}
+
+Identity pose construction (identity transform constructor (identitySE3)) corresponds to $\mathbf{R}=\mathbf{I}$ and $\mathbf{t}=\mathbf{0}$. Pose composition (compose) corresponds to the composition equation in Step~1. Pose inversion (inverse) corresponds to the inverse equation in Step~1. Point transformation (applyPoint) corresponds to $\mathbf{x}'=\mathbf{R}\mathbf{x}+\mathbf{t}$. Nearest-neighbor pairing (nearestNeighborBruteforce) corresponds to the $\arg\min$ assignment and distance definitions in Step~3. Trimming selection (trimSelection) corresponds to the $K_{\text{keep}}$ and $\mathcal{I}$ definitions in Step~4. SVD rigid fitting (kabschSE3) corresponds to centroid, cross-covariance, SVD, rotation, determinant constraint, and translation equations in Step~5. The iterative refinement loop (icpPointToPoint) corresponds to the pose update, RMSE, and convergence equations in Step~6. Non-degeneracy checking (nondegenerateTriple) corresponds to the cross-product inequality in Step~7. Robust model selection and refit (ransacSE3) corresponds to the inlier test and refit objective in Step~7. Pose error reporting (poseError) corresponds to the relative transform, trace-to-angle mapping, and translation norm in Step~8.
+
+\end{document}
