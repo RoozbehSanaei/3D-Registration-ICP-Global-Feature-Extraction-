@@ -4,7 +4,7 @@ This repository contains:
 - a Python implementation,
 - a C++20 implementation (Armadillo),
 - a technical accuracy report,
-- and an equation-based algorithm write-up (LaTeX + PDF).
+- and an algorithm write-up (LaTeX + PDF).
 
 ---
 
